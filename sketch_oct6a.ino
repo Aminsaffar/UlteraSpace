@@ -42,9 +42,9 @@ const int serverPort = 80;
 bool sim800lReady = false;
 bool gprsConnected = false;
 unsigned long lastGprsCheckMillis = 0;
-const unsigned long GPRS_CHECK_INTERVAL_MS = 60000; // Check GPRS every 60 seconds
+const unsigned long GPRS_CHECK_INTERVAL_MS = 25 * 60000; // Check GPRS every 25 minutes
 unsigned long lastDataSendMillis = 0;
-const unsigned long DATA_SEND_INTERVAL_MS = 30000;  // Send data every 30 seconds
+const unsigned long DATA_SEND_INTERVAL_MS = 120000;  // Send data every 2 minutes
 String sim800lResponse = "";
 
 // LED Configuration (for serial activity indicator)
@@ -94,8 +94,8 @@ const unsigned long LOG_MAX_INTERVAL_MS = 30UL * 1000UL; // maximum time between
 const double SIGNIFICANT_DISTANCE_METERS = 10.0; // minimum distance change to consider (meters)
 
 // Storage management
-const size_t MAX_LOG_FILE_SIZE = 640 * 1024; // trim when >64KB
-const size_t LOG_TRIM_KEEP_BYTES = 320 * 1024; // keep the newest ~32KB of log entries when trimming
+const size_t MAX_LOG_FILE_SIZE = 640 * 1024; // trim when >720KB
+const size_t LOG_TRIM_KEEP_BYTES = 320 * 1024; // keep the newest ~460KB of log entries when trimming
 const float STORAGE_HIGH_WATERMARK = 0.90; // fraction used of LittleFS to trigger cleanup
 
 struct KnownNetwork {
@@ -115,7 +115,7 @@ String stationIpStr = "Not connected";
 String currentStationSsid = "";
 String apIpStr = "";
 
-const unsigned long WIFI_SCAN_INTERVAL_MS = 60UL * 1000UL; // rescan for known networks every minute
+const unsigned long WIFI_SCAN_INTERVAL_MS = 20 * 60UL * 1000UL; // rescan for known networks every 20 minutes
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000UL;
 unsigned long lastWifiScanMillis = 0;
 
@@ -125,7 +125,7 @@ double lastLoggedLat = 0.0;
 double lastLoggedLng = 0.0;
 unsigned long lastLoggedMillis = 0;
 unsigned long lastStorageCheckMillis = 0;
-const unsigned long STORAGE_CHECK_INTERVAL_MS = 600UL * 1000UL; // check storage every 2 minutes (reduced frequency)
+const unsigned long STORAGE_CHECK_INTERVAL_MS = 5UL * 60UL * 1000UL; // check storage every 5 minutes
 
 // Small helper: Haversine distance (meters)
 double haversineDistance(double lat1, double lon1, double lat2, double lon2) {
@@ -241,45 +241,84 @@ void maintainWiFi() {
 }
 
 // Trim the current log file to keep only the newest entries (single-file policy)
+// void trimLogFile() {
+//   if (!LittleFS.exists(dataPath)) return;
+//   File file = LittleFS.open(dataPath, FILE_READ);
+//   if (!file) return;
+
+//   size_t fileSize = file.size();
+//   if (fileSize <= MAX_LOG_FILE_SIZE) {
+//     file.close();
+//     return;
+//   }
+
+//   String header = file.readStringUntil('\n');
+//   String remaining = file.readString();
+//   file.close();
+
+//   size_t keepBytes = LOG_TRIM_KEEP_BYTES;
+//   if (keepBytes == 0 || keepBytes > remaining.length()) {
+//     keepBytes = remaining.length();
+//   }
+
+//   size_t startIndex = remaining.length() > keepBytes ? remaining.length() - keepBytes : 0;
+//   // adjust to next newline boundary to ensure we keep whole rows
+//   int newlineAfter = remaining.indexOf('\n', startIndex);
+//   if (newlineAfter != -1 && (size_t)newlineAfter < remaining.length() - 1) {
+//     startIndex = newlineAfter + 1; // skip partial row
+//   } else if (startIndex > 0) {
+//     int newlineBefore = remaining.lastIndexOf('\n', startIndex);
+//     if (newlineBefore != -1 && (size_t)newlineBefore + 1 < remaining.length()) {
+//       startIndex = newlineBefore + 1;
+//     }
+//   }
+
+//   String trimmed = remaining.substring(startIndex);
+
+//   File out = LittleFS.open(dataPath, FILE_WRITE);
+//   if (!out) return;
+//   out.println(header);
+//   out.print(trimmed);
+//   out.close();
+//   Serial.println("Log file trimmed to maintain size limits.");
+// }
 void trimLogFile() {
   if (!LittleFS.exists(dataPath)) return;
-  File file = LittleFS.open(dataPath, FILE_READ);
-  if (!file) return;
+  File in = LittleFS.open(dataPath, FILE_READ);
+  if (!in) return;
 
-  size_t fileSize = file.size();
+  String header = in.readStringUntil('\n');
+  size_t fileSize = in.size();
   if (fileSize <= MAX_LOG_FILE_SIZE) {
-    file.close();
+    in.close();
     return;
   }
 
-  String header = file.readStringUntil('\n');
-  String remaining = file.readString();
-  file.close();
-
   size_t keepBytes = LOG_TRIM_KEEP_BYTES;
-  if (keepBytes == 0 || keepBytes > remaining.length()) {
-    keepBytes = remaining.length();
+  if (keepBytes == 0 || keepBytes > fileSize) keepBytes = fileSize;
+
+  size_t startPos = fileSize - keepBytes;
+  in.seek(startPos);
+
+  // align to next full line
+  in.readStringUntil('\n'); // discard partial line
+
+  File out = LittleFS.open("/tmp_log.csv", FILE_WRITE);
+  if (!out) { in.close(); return; }
+
+  out.print(header);
+  out.print('\n');
+
+  while (in.available()) {
+    out.write(in.read());
   }
 
-  size_t startIndex = remaining.length() > keepBytes ? remaining.length() - keepBytes : 0;
-  // adjust to next newline boundary to ensure we keep whole rows
-  int newlineAfter = remaining.indexOf('\n', startIndex);
-  if (newlineAfter != -1 && (size_t)newlineAfter < remaining.length() - 1) {
-    startIndex = newlineAfter + 1; // skip partial row
-  } else if (startIndex > 0) {
-    int newlineBefore = remaining.lastIndexOf('\n', startIndex);
-    if (newlineBefore != -1 && (size_t)newlineBefore + 1 < remaining.length()) {
-      startIndex = newlineBefore + 1;
-    }
-  }
-
-  String trimmed = remaining.substring(startIndex);
-
-  File out = LittleFS.open(dataPath, FILE_WRITE);
-  if (!out) return;
-  out.println(header);
-  out.print(trimmed);
+  in.close();
   out.close();
+
+  LittleFS.remove(dataPath);
+  LittleFS.rename("/tmp_log.csv", dataPath);
+
   Serial.println("Log file trimmed to maintain size limits.");
 }
 
@@ -364,7 +403,8 @@ void trimLogFile() {
   .card{background:rgba(15,23,42,0.55);border-radius:18px;padding:20px;box-shadow:0 24px 48px rgba(15,23,42,0.55);border:1px solid rgba(148,163,184,0.22);}
   label{display:block;text-transform:uppercase;font-size:0.75rem;letter-spacing:.15em;color:#9ea6c9;margin-top:12px;}
   .value{font-size:1.4rem;font-weight:600;margin-top:4px;color:#f8fbff;}
-  a.btn{display:inline-flex;align-items:center;justify-content:center;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;background:#5c6cff;color:white;box-shadow:0 16px 32px rgba(92,108,255,0.35);margin-top:8px;}
+  .actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;}
+  a.btn{display:inline-flex;align-items:center;justify-content:center;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;background:#5c6cff;color:white;box-shadow:0 16px 32px rgba(92,108,255,0.35);}
   footer{padding:20px 32px;text-align:center;font-size:0.85rem;color:#7c86a7;}
   </style>
   </head>
@@ -386,7 +426,10 @@ void trimLogFile() {
       <label>Visible Satellites</label>
       <div class="value">{{SAT}}</div>
     </div>
-    <a class="btn" href="/download">Download Latest CSV</a>
+    <div class="actions">
+      <a class="btn" href="/download">Download Latest CSV</a>
+      <a class="btn" href="/trace">GPS Trace</a>
+    </div>
     <div class="card">
       <label>Current Hotspot</label>
       <div class="value">SSID: {{AP_SSID}}</div>
@@ -513,7 +556,8 @@ void trimLogFile() {
       </div>
     </section>
     <section class="actions">
-      <a class="btn" href="/download">Download CSV</a>
+      <a class="btn" href="/gpslog.csv">Download CSV</a>
+      <a class="btn" href="/trace">GPS Trace</a>
       <a class="btn secondary" href="/data.json" target="_blank">Open Real-time JSON</a>
     </section>
     <table>
@@ -673,6 +717,7 @@ void manageStorageIfNeeded() {
     File f = LittleFS.open(dataPath, FILE_READ);
     if (f) {
       size_t sz = f.size();
+      Serial.printf("Log file size: %u bytes\n", (unsigned)sz);
       f.close();
       if (sz >= MAX_LOG_FILE_SIZE) {
         trimLogFile();
@@ -684,10 +729,10 @@ void manageStorageIfNeeded() {
   if (!trimmed && total > 0 && usedFrac >= STORAGE_HIGH_WATERMARK) {
     trimLogFile();
     trimmed = true;
-    #ifdef __ESP32__
+    // Recalculate usage after trim
+    total = LittleFS.totalBytes();
     used = LittleFS.usedBytes();
     usedFrac = total > 0 ? (float)used / (float)total : 0.0f;
-    #endif
   }
 
   if (total > 0 && usedFrac >= STORAGE_HIGH_WATERMARK) {
@@ -705,14 +750,14 @@ void manageStorageIfNeeded() {
 
 // Function to append data to CSV file
 void appendFile(fs::FS &fs, const char * path, const char * message) {
-  Serial.printf("Appending to file: %s\n", path);
+  // Serial.printf("Appending to file: %s\n", path);
   File file = fs.open(path, FILE_APPEND);
   if (!file) {
     Serial.println("Failed to open file for appending");
     return;
   }
   if (file.print(message)) {
-    Serial.println("Message appended");
+    // Serial.println("Message appended");
   } else {
     Serial.println("Append failed");
   }
@@ -1191,6 +1236,189 @@ void handleDownload(AsyncWebServerRequest *request) {
   }
 }
 
+// Handle GPS Trace page with interactive map
+void handleTrace(AsyncWebServerRequest *request) {
+  String page = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  page += "<title>GPS Trace</title>";
+  page += "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>";
+  page += "<style>";
+  page += "body{margin:0;font-family:Arial,sans-serif;background:#0b0d17;color:#f5f7ff;display:flex;flex-direction:column;height:100vh;overflow:hidden;}";
+  page += "header{padding:16px 24px;background:rgba(15,23,42,0.95);border-bottom:1px solid rgba(148,163,184,0.22);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}";
+  page += "h1{margin:0;font-size:1.5rem;color:#f8fbff;}";
+  page += ".controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}";
+  page += ".btn{padding:8px 16px;border-radius:999px;text-decoration:none;background:#5c6cff;color:white;border:none;cursor:pointer;font-size:0.9rem;}";
+  page += ".btn.secondary{background:rgba(148,163,184,0.22);}";
+  page += ".btn.upload{background:#10b981;position:relative;overflow:hidden;}";
+  page += ".btn.upload input{position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;cursor:pointer;}";
+  page += ".btn.theme{background:#8b5cf6;}";
+  page += ".btn.live-active{background:#10b981;animation:pulse 2s infinite;}";
+  page += "@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.7;}}";
+  page += "#map{flex:1;width:100%;position:relative;}";
+  page += "#info{position:absolute;top:80px;right:16px;background:rgba(15,23,42,0.95);padding:16px;border-radius:12px;max-width:250px;z-index:1000;border:1px solid rgba(148,163,184,0.22);max-height:calc(100vh - 100px);overflow-y:auto;}";
+  page += "#infoToggle{display:none;position:fixed;bottom:16px;right:16px;width:56px;height:56px;border-radius:50%;background:#5c6cff;color:white;border:none;font-size:1.5rem;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:999;cursor:pointer;}";
+  page += "@media (max-width:768px){";
+  page += "#info{display:none;top:auto;bottom:16px;right:16px;left:16px;max-width:none;max-height:60vh;font-size:0.85rem;}";
+  page += "#info.show{display:block;}";
+  page += "#infoToggle{display:block;}";
+  page += "#info h3{font-size:0.9rem;}";
+  page += "#info p{font-size:0.75rem;margin:2px 0;}";
+  page += ".legend-item{font-size:0.7rem;}";
+  page += "header{padding:12px 16px;}";
+  page += "h1{font-size:1.2rem;}";
+  page += ".btn{padding:6px 12px;font-size:0.8rem;}";
+  page += "}";
+  page += "#info h3{margin:0 0 8px;font-size:1rem;}";
+  page += "#info p{margin:4px 0;font-size:0.85rem;}";
+  page += ".legend{margin-top:12px;padding-top:12px;border-top:1px solid rgba(148,163,184,0.22);}";
+  page += ".legend-item{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:0.8rem;}";
+  page += ".legend-color{width:20px;height:4px;border-radius:2px;}";
+  page += "#loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(15,23,42,0.95);padding:24px;border-radius:12px;z-index:2000;text-align:center;}";
+  page += "#source{margin-top:8px;font-size:0.75rem;color:#94a3b8;padding-top:8px;border-top:1px solid rgba(148,163,184,0.22);}";
+  page += "</style></head><body>";
+  page += "<header><h1>GPS Trace Map</h1><div class='controls'>";
+  page += "<button class='btn' onclick='loadDefault()'>Device Log</button> ";
+  page += "<button class='btn' id='liveBtn' onclick='toggleLive()'>🚗 Live Track</button> ";
+  page += "<label class='btn upload'>Upload CSV<input type='file' accept='.csv' onchange='loadCustomFile(this)'></label> ";
+  page += "<button class='btn theme' id='themeBtn' onclick='toggleTheme()'>🌙 Night</button> ";
+  page += "<button class='btn secondary' onclick='location.reload()'>Refresh</button> ";
+  page += "<a class='btn secondary' href='/'>Back</a>";
+  page += "</div></header>";
+  page += "<div id='map'></div>";
+  page += "<button id='infoToggle' onclick='toggleInfo()'>📊</button>";
+  page += "<div id='info'><h3>Route Info</h3>";
+  page += "<p id='liveStatus' style='display:none;color:#10b981;font-weight:bold;margin-bottom:8px;'>🔴 Live Tracking</p>";
+  page += "<p id='pointCount'>Points: 0</p>";
+  page += "<p id='distance'>Distance: 0 km</p>";
+  page += "<p id='maxSpeed'>Max Speed: 0 km/h</p>";
+  page += "<p id='currentSpeed' style='display:none;'>Current: 0 km/h</p>";
+  page += "<div class='legend'>";
+  page += "<div class='legend-item'><div class='legend-color' style='background:#22c55e'></div>&lt; 20 km/h</div>";
+  page += "<div class='legend-item'><div class='legend-color' style='background:#84cc16'></div>20-40 km/h</div>";
+  page += "<div class='legend-item'><div class='legend-color' style='background:#eab308'></div>40-60 km/h</div>";
+  page += "<div class='legend-item'><div class='legend-color' style='background:#f97316'></div>60-80 km/h</div>";
+  page += "<div class='legend-item'><div class='legend-color' style='background:#ef4444'></div>80-100 km/h</div>";
+  page += "<div class='legend-item'><div class='legend-color' style='background:#dc2626'></div>&gt; 100 km/h</div>";
+  page += "</div>";
+  page += "<p id='source'>Source: Device</p>";
+  page += "</div>";
+  page += "<div id='loading'>Loading GPS data...</div>";
+  page += "<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>";
+  page += "<script>";
+  page += "var map=L.map('map').setView([0,0],2),mapLayers=[],isDarkMode=false,tileLayer,liveMarker=null,liveInterval=null,isLiveMode=false,userInteracted=false;";
+  page += "tileLayer=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);";
+  page += "var carIcon=L.divIcon({className:'car-icon',html:'<div style=\"font-size:32px;text-shadow:0 0 3px #000;\">🚗</div>',iconSize:[32,32],iconAnchor:[16,16]});";
+  page += "map.on('zoomstart',function(){userInteracted=true;});";
+  page += "map.on('movestart',function(){userInteracted=true;});";
+  page += "function toggleInfo(){";
+  page += "var info=document.getElementById('info');";
+  page += "info.classList.toggle('show');}";
+  page += "document.getElementById('map').addEventListener('click',function(e){";
+  page += "if(window.innerWidth<=768&&e.target.id==='map'){";
+  page += "document.getElementById('info').classList.remove('show');}});";
+  page += "function toggleLive(){";
+  page += "isLiveMode=!isLiveMode;";
+  page += "var btn=document.getElementById('liveBtn'),status=document.getElementById('liveStatus'),currSpd=document.getElementById('currentSpeed');";
+  page += "if(isLiveMode){";
+  page += "userInteracted=false;";
+  page += "btn.classList.add('live-active');";
+  page += "btn.innerHTML='⏹️ Stop Live';";
+  page += "status.style.display='block';";
+  page += "currSpd.style.display='block';";
+  page += "clearMap();";
+  page += "document.getElementById('source').textContent='Source: Live GPS';";
+  page += "updateLivePosition();";
+  page += "liveInterval=setInterval(updateLivePosition,3000);";
+  page += "}else{";
+  page += "btn.classList.remove('live-active');";
+  page += "btn.innerHTML='🚗 Live Track';";
+  page += "status.style.display='none';";
+  page += "currSpd.style.display='none';";
+  page += "if(liveInterval)clearInterval(liveInterval);";
+  page += "if(liveMarker)map.removeLayer(liveMarker);";
+  page += "liveMarker=null;";
+  page += "}}";
+  page += "function updateLivePosition(){";
+  page += "fetch('/data.json').then(r=>r.json()).then(data=>{";
+  page += "var lat=parseFloat(data.lat),lng=parseFloat(data.lng),spd=parseFloat(data.speedKmph)||0;";
+  page += "if(isNaN(lat)||isNaN(lng)||lat==0||lng==0)return;";
+  page += "if(liveMarker)map.removeLayer(liveMarker);";
+  page += "liveMarker=L.marker([lat,lng],{icon:carIcon}).addTo(map);";
+  page += "liveMarker.bindPopup('<b>Current Position</b><br>Speed: '+spd+' km/h<br>Time: '+data.time+'<br>Satellites: '+data.satellites);";
+  page += "if(!userInteracted){map.setView([lat,lng],16);}";
+  page += "document.getElementById('currentSpeed').innerHTML='<b>Current: '+spd+' km/h</b>';";
+  page += "document.getElementById('liveStatus').innerHTML='🔴 Live - Updated: '+new Date().toLocaleTimeString();";
+  page += "}).catch(e=>console.log('Live update error:',e));}";
+  page += "function toggleTheme(){";
+  page += "isDarkMode=!isDarkMode;";
+  page += "var btn=document.getElementById('themeBtn');";
+  page += "map.removeLayer(tileLayer);";
+  page += "if(isDarkMode){";
+  page += "tileLayer=L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19,attribution:'&copy; CARTO'}).addTo(map);";
+  page += "btn.innerHTML='☀️ Day';";
+  page += "}else{";
+  page += "tileLayer=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);";
+  page += "btn.innerHTML='🌙 Night';";
+  page += "}}";
+  page += "function getSpeedColor(s){";
+  page += "if(s<20)return'#22c55e';";
+  page += "if(s<40)return'#84cc16';";
+  page += "if(s<60)return'#eab308';";
+  page += "if(s<80)return'#f97316';";
+  page += "if(s<100)return'#ef4444';";
+  page += "return'#dc2626';}";
+  page += "function calcDist(lat1,lon1,lat2,lon2){";
+  page += "var R=6371,dLat=(lat2-lat1)*Math.PI/180,dLon=(lon2-lon1)*Math.PI/180;";
+  page += "var a=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)*Math.sin(dLon/2);";
+  page += "return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));}";
+  page += "function clearMap(){mapLayers.forEach(l=>map.removeLayer(l));mapLayers=[];}";
+  page += "function renderRoute(csv,source){";
+  page += "clearMap();";
+  page += "document.getElementById('loading').style.display='block';";
+  page += "document.getElementById('loading').innerHTML='Processing route...';";
+  page += "setTimeout(function(){";
+  page += "var lines=csv.trim().split('\\n'),pts=[],dist=0,maxSpd=0;";
+  page += "if(lines.length<2){document.getElementById('loading').innerHTML='<p>No GPS data</p><p>Expected CSV format:<br>Time,Lat,Lng,Alt,Speed,Satellites</p>';return;}";
+  page += "for(var i=1;i<lines.length;i++){";
+  page += "var c=lines[i].split(',');if(c.length<5)continue;";
+  page += "var lat=parseFloat(c[1]),lng=parseFloat(c[2]),spd=parseFloat(c[4])||0;";
+  page += "if(!isNaN(lat)&&!isNaN(lng)&&lat!=0&&lng!=0){";
+  page += "pts.push({time:c[0],lat:lat,lng:lng,alt:parseFloat(c[3])||0,speed:spd,sat:c[5]||'N/A'});";
+  page += "if(spd>maxSpd)maxSpd=spd;}}";
+  page += "if(pts.length==0){document.getElementById('loading').innerHTML='<p>No valid coordinates found</p><p>Check CSV format</p>';return;}";
+  page += "for(var i=1;i<pts.length;i++){dist+=calcDist(pts[i-1].lat,pts[i-1].lng,pts[i].lat,pts[i].lng);";
+  page += "var avgSpd=(pts[i-1].speed+pts[i].speed)/2,col=getSpeedColor(avgSpd);";
+  page += "var ln=L.polyline([[pts[i-1].lat,pts[i-1].lng],[pts[i].lat,pts[i].lng]],{color:col,weight:4,opacity:0.8}).addTo(map);";
+  page += "ln.bindPopup('<b>Seg '+i+'</b><br>Speed: '+avgSpd.toFixed(1)+' km/h<br>Time: '+pts[i].time+'<br>Alt: '+pts[i].alt.toFixed(1)+'m<br>Sat: '+pts[i].sat);";
+  page += "mapLayers.push(ln);}";
+  page += "var startMrk=L.marker([pts[0].lat,pts[0].lng]).addTo(map).bindPopup('<b>Start</b><br>'+pts[0].time);";
+  page += "var endMrk=L.marker([pts[pts.length-1].lat,pts[pts.length-1].lng]).addTo(map).bindPopup('<b>End</b><br>'+pts[pts.length-1].time);";
+  page += "mapLayers.push(startMrk);mapLayers.push(endMrk);";
+  page += "if(!userInteracted){map.fitBounds(L.latLngBounds(pts.map(p=>[p.lat,p.lng])),{padding:[50,50]});}";
+  page += "document.getElementById('pointCount').textContent='Points: '+pts.length;";
+  page += "document.getElementById('distance').textContent='Distance: '+dist.toFixed(2)+' km';";
+  page += "document.getElementById('maxSpeed').textContent='Max Speed: '+maxSpd.toFixed(1)+' km/h';";
+  page += "document.getElementById('source').textContent='Source: '+source;";
+  page += "document.getElementById('loading').style.display='none';";
+  page += "},100);}";
+  page += "function loadDefault(){";
+  page += "userInteracted=false;";
+  page += "fetch('/gpslog.csv').then(r=>r.text()).then(csv=>renderRoute(csv,'Device Log'))";
+  page += ".catch(e=>{document.getElementById('loading').innerHTML='<p>Error loading device log</p><p>'+e.message+'</p>';});}";
+  page += "function loadCustomFile(input){";
+  page += "if(!input.files||!input.files[0])return;";
+  page += "userInteracted=false;";
+  page += "var file=input.files[0];";
+  page += "if(!file.name.toLowerCase().endsWith('.csv')){alert('Please select a CSV file');return;}";
+  page += "var reader=new FileReader();";
+  page += "reader.onload=function(e){renderRoute(e.target.result,'Custom: '+file.name);};";
+  page += "reader.onerror=function(){document.getElementById('loading').innerHTML='<p>Error reading file</p>';};";
+  page += "reader.readAsText(file);}";
+  page += "loadDefault();";
+  page += "</script></body></html>";
+  request->send(200, "text/html", page);
+}
+
 void setup() {
   Serial.begin(115200); //comment for production
   Serial.println("Starting ESP32 GPS Datalogger (Async)...");
@@ -1262,6 +1490,7 @@ void setup() {
 
   // Configure WiFi (AP + STA)
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setHostname("ulteraSpace");  // Set hostname for network identification
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWiFiEvent);
@@ -1269,6 +1498,7 @@ void setup() {
   WiFi.softAP(ssid, password);
   apIpStr = WiFi.softAPIP().toString();
   Serial.printf("AP SSID: %s | IP: %s\n", ssid, apIpStr.c_str());
+  Serial.printf("Hostname set to: ulteraSpace\n");
 
   WiFi.disconnect(true);
   delay(100);
@@ -1282,6 +1512,8 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/data.json", HTTP_GET, handleDataJson);
   server.on("/download", HTTP_GET, handleDownload);
+  server.on("/trace", HTTP_GET, handleTrace);
+  server.serveStatic("/gpslog.csv", LittleFS, "/gpslog.csv");
   server.begin();
   Serial.println("Async Web server started");
 }
@@ -1349,6 +1581,7 @@ void loop() {
         shouldLog = true;
       }
     }
+
     if (shouldLog) {
       // Prepare CSV row
       String dataMessage = lastTime + "," + 
@@ -1358,6 +1591,7 @@ void loop() {
                            String(gps.speed.kmph()) + "," + 
                            String(gps.satellites.value()) + "\r\n";
 
+      
       // Append to file
       appendFile(LittleFS, dataPath, dataMessage.c_str());
 

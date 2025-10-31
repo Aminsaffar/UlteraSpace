@@ -35,7 +35,8 @@ const char* gprsUser = "";     // GPRS username (often empty)
 const char* gprsPass = "";     // GPRS password (often empty)
 
 // Webserver endpoint for GPS data
-const char* serverUrl = "http://amins.ir/api/gps";  // Change to your server URL
+const char* serverUrl = "http://www.baghalimoon.ir/gps/api/gps";  // Change to your server URL
+const char* serverUrlFull = "http://www.baghalimoon.ir/gps/api/full_gps";  // CSV upload endpoint
 const int serverPort = 80;
 
 // SIM800L state management
@@ -44,8 +45,22 @@ bool gprsConnected = false;
 unsigned long lastGprsCheckMillis = 0;
 const unsigned long GPRS_CHECK_INTERVAL_MS = 25 * 60000; // Check GPRS every 25 minutes
 unsigned long lastDataSendMillis = 0;
-const unsigned long DATA_SEND_INTERVAL_MS = 120000;  // Send data every 2 minutes
+const unsigned long DATA_SEND_INTERVAL_MS = 15 * 60000;  // Send data every 15 minutes
+unsigned long lastCSVSendMillis = 0;
+const unsigned long CSV_SEND_INTERVAL_MS = 3 * 60 * 60000;  // Send CSV every 3 hours
+const double SEND_DISTANCE_THRESHOLD_METERS = 500.0; // Send when moved > 500 meters
+const unsigned long STATIONARY_TIMEOUT_MS = 5 * 60000; // Consider stationary after 5 minutes no movement
+double lastSentLat = 0.0;
+double lastSentLng = 0.0;
+bool hasLastSent = false;
+bool isMoving = false;
+unsigned long lastMovementMillis = 0;
 String sim800lResponse = "";
+String lastCSVSendTime = "Never";
+String lastCSVSendStatus = "N/A";
+
+// Power saving configuration
+bool turn_off_wifi_station_for_powersaving = true; // Set to false to keep WiFi AP always on
 
 // LED Configuration (for serial activity indicator)
 #define LED_PIN 2
@@ -565,6 +580,7 @@ void trimLogFile() {
         <tr><th>WiFi Link</th><td><span id="connectionBadge" class="badge">Online</span></td><td id="linkNote">Connected to {{WIFI_SSID}}</td></tr>
         <tr><th>SIM800L Status</th><td>{{SIM_STATUS}}</td><td>GPRS: {{GPRS_STATUS}}</td></tr>
         <tr><th>Last Data Sent</th><td>{{LAST_SEND_TIME}}</td><td>{{LAST_SEND_STATUS}}</td></tr>
+        <tr><th>Last CSV Upload</th><td>{{LAST_CSV_SEND_TIME}}</td><td>{{LAST_CSV_SEND_STATUS}}</td></tr>
         <tr><th>Log File</th><td>{{FILE_SIZE}}</td><td>Auto trims beyond {{MAX_SIZE}} KB</td></tr>
         <tr><th>AP Access</th><td>{{AP_SSID}} · {{AP_IP}}</td><td>Use direct AP when hotspot unavailable</td></tr>
       </tbody>
@@ -632,6 +648,8 @@ void trimLogFile() {
     page.replace("{{GPRS_STATUS}}", gprsStatus);
     page.replace("{{LAST_SEND_TIME}}", lastSendTime);
     page.replace("{{LAST_SEND_STATUS}}", lastSendStatus);
+    page.replace("{{LAST_CSV_SEND_TIME}}", lastCSVSendTime);
+    page.replace("{{LAST_CSV_SEND_STATUS}}", lastCSVSendStatus);
     page.replace("{{CHIP_MODEL}}", chipModelStr);
     page.replace("{{CPU_FREQ}}", cpuFreqStr);
     page.replace("{{FREE_HEAP}}", freeHeapStr);
@@ -1091,12 +1109,86 @@ bool connectGPRS() {
   return false;
 }
 
+// Disconnect GPRS to save battery
+void disconnectGPRS() {
+  if (!gprsConnected) return;
+  
+  Serial.println("Disconnecting GPRS (stationary mode)...");
+  
+  // Terminate any ongoing HTTP sessions
+  sendATCommand("AT+HTTPTERM", 2000);
+  delay(500);
+  
+  // Close GPRS bearer
+  String closeResp = sendATCommand("AT+SAPBR=0,1", 10000);
+  delay(1000);
+  
+  // Verify bearer is closed
+  String queryResp = sendATCommand("AT+SAPBR=2,1", 3000);
+  if (queryResp.indexOf("0,0") != -1) {
+    Serial.println("Bearer successfully closed");
+  } else {
+    Serial.println("Warning: Bearer may still be active");
+  }
+  
+  // Detach from GPRS service
+  sendATCommand("AT+CGATT=0", 5000);
+  delay(1000);
+  
+  gprsConnected = false;
+  gprsStatus = "Disconnected (stationary)";
+  Serial.println("GPRS fully disconnected - module should stop fast blinking");
+}
+
+// Put SIM800L into sleep mode to save battery
+void sleepSIM800L() {
+  Serial.println("Putting SIM800L to low power mode...");
+  
+  // Option 1: Use sleep mode (AT+CSCLK=2) - may not work on all modules
+  // If this causes issues, comment out and use Option 2 instead
+  sendATCommand("AT+CSCLK=2", 2000); // Enable auto-sleep mode
+  
+  // Option 2: Alternative - Minimum functionality mode (uncomment if sleep doesn't work)
+  // sendATCommand("AT+CFUN=0", 3000); // Minimum functionality
+  
+  sim800lStatus = "Sleep Mode";
+  Serial.println("SIM800L in low power mode");
+}
+
+// Wake up SIM800L from sleep mode
+void wakeSIM800L() {
+  Serial.println("Waking up SIM800L...");
+  
+  // Disable sleep mode
+  sendATCommand("AT+CSCLK=0", 2000);
+  delay(500);
+  
+  // If you're using CFUN=0 sleep, uncomment this instead:
+  // sendATCommand("AT+CFUN=1", 3000); // Full functionality
+  // delay(2000);
+  
+  // Test communication
+  sendATCommand("AT", 1000);
+  sim800lStatus = "Awake";
+  Serial.println("SIM800L awake");
+}
+
 // Send GPS data to webserver via HTTP POST
 bool sendGPSDataToServer() {
-  if (!gprsConnected || !gps.location.isValid()) {
-    Serial.println("Cannot send data: GPRS not connected or GPS invalid");
-    lastSendStatus = "Failed - No connection";
+  if (!gps.location.isValid()) {
+    Serial.println("Cannot send data: GPS invalid");
+    lastSendStatus = "Failed - No GPS fix";
     return false;
+  }
+  
+  // Check if we need to connect GPRS first
+  if (!gprsConnected) {
+    Serial.println("GPRS not connected, connecting now...");
+    if (!connectGPRS()) {
+      Serial.println("Failed to connect GPRS");
+      lastSendStatus = "Failed - GPRS connection";
+      return false;
+    }
   }
   
   Serial.println("Sending GPS data to server...");
@@ -1156,6 +1248,10 @@ bool sendGPSDataToServer() {
     Serial.println("Failed to get DOWNLOAD prompt");
     sendATCommand("AT+HTTPTERM", 2000);
     lastSendStatus = "Failed - Download";
+    
+    // Disconnect GPRS to save battery
+    disconnectGPRS();
+    
     return false;
   }
   
@@ -1163,25 +1259,343 @@ bool sendGPSDataToServer() {
   sim800lSerial.print(jsonData);
   delay(500);
   
-  // Execute HTTP POST
-  String postResp = sendATCommand("AT+HTTPACTION=1", 15000);
-  delay(3000);
+  // Execute HTTP POST (this returns OK immediately)
+  sim800lSerial.println("AT+HTTPACTION=1");
+  Serial.println("AT Command: AT+HTTPACTION=1");
   
-  // Read HTTP response
+  // Wait for the actual +HTTPACTION response (comes asynchronously)
+  unsigned long httpStart = millis();
+  String httpResponse = "";
+  bool httpActionReceived = false;
+  
+  while (millis() - httpStart < 15000) { // 15 second timeout
+    if (sim800lSerial.available()) {
+      char c = sim800lSerial.read();
+      httpResponse += c;
+      Serial.print(c);
+      
+      // Check if we received the +HTTPACTION response
+      if (httpResponse.indexOf("+HTTPACTION:") != -1) {
+        httpActionReceived = true;
+        delay(100); // Wait a bit more to get the complete line
+        while (sim800lSerial.available()) {
+          c = sim800lSerial.read();
+          httpResponse += c;
+          Serial.print(c);
+        }
+        break;
+      }
+    }
+    delay(10);
+  }
+  
+  Serial.println();
+  Serial.print("HTTP Response: ");
+  Serial.println(httpResponse);
+  
+  // Read HTTP response body
   String readResp = sendATCommand("AT+HTTPREAD", 5000);
   
   // Terminate HTTP
   sendATCommand("AT+HTTPTERM", 2000);
   
-  // Check if successful
-  if (postResp.indexOf("+HTTPACTION: 1,200") != -1 || postResp.indexOf("+HTTPACTION: 1,201") != -1) {
+  // Check if successful (200 or 201 status code)
+  if (httpResponse.indexOf("+HTTPACTION: 1,200") != -1 || httpResponse.indexOf("+HTTPACTION: 1,201") != -1) {
     Serial.println("Data sent successfully!");
     lastSendStatus = "Success";
     lastSendTime = lastTime;
+    
+    // Update last sent location
+    lastSentLat = gps.location.lat();
+    lastSentLng = gps.location.lng();
+    hasLastSent = true;
+    lastDataSendMillis = millis();
+    
+    // DON'T disconnect GPRS if moving - we'll send again soon
+    // GPRS will be disconnected by maintainGPRS() when stationary
+    if (isMoving) {
+      Serial.println("Device is moving - keeping GPRS connected for next transmission");
+      gprsStatus = "Connected (moving)";
+    } else {
+      Serial.println("Device stationary - will disconnect GPRS if no movement detected");
+    }
+    
     return true;
   } else {
     Serial.println("HTTP POST failed");
+    Serial.print("Expected +HTTPACTION: 1,200 or 201, but got: ");
+    Serial.println(httpResponse);
     lastSendStatus = "Failed - HTTP";
+    
+    // Disconnect GPRS on failure
+    disconnectGPRS();
+    
+    return false;
+  }
+}
+
+// Send CSV file to server
+bool sendCSVToServer() {
+  if (!LittleFS.exists(dataPath)) {
+    Serial.println("CSV file does not exist");
+    lastCSVSendStatus = "Failed - No file";
+    return false;
+  }
+  
+  // Check if we need to connect GPRS first
+  if (!gprsConnected) {
+    Serial.println("GPRS not connected, connecting now...");
+    if (!connectGPRS()) {
+      Serial.println("Failed to connect GPRS for CSV upload");
+      lastCSVSendStatus = "Failed - GPRS connection";
+      return false;
+    }
+  }
+  
+  Serial.println("Uploading CSV file to server...");
+  lastCSVSendStatus = "Uploading...";
+  
+  // Read CSV file
+  File csvFile = LittleFS.open(dataPath, FILE_READ);
+  if (!csvFile) {
+    Serial.println("Failed to open CSV file");
+    lastCSVSendStatus = "Failed - File open error";
+    return false;
+  }
+  
+  size_t fileSize = csvFile.size();
+  Serial.printf("CSV file size on disk: %u bytes\n", fileSize);
+  
+  // Check if file is too large for memory
+  const size_t MAX_CSV_SIZE = 35000; // 35KB limit
+  size_t csvSize = fileSize;
+  size_t startPos = 0;
+  bool needsHeader = false;
+  
+  if (fileSize > MAX_CSV_SIZE) {
+    Serial.printf("CSV file too large (%u bytes), will send last %u bytes with header\n", fileSize, MAX_CSV_SIZE);
+    startPos = fileSize - MAX_CSV_SIZE;
+    csvSize = MAX_CSV_SIZE;
+    needsHeader = true; // We'll add header since we're skipping the beginning
+    
+    // Seek to start position
+    csvFile.seek(startPos);
+    
+    // Skip to next newline to avoid partial record
+    while (csvFile.available() && csvFile.read() != '\n') {
+      csvSize--;
+    }
+  }
+  
+  // Read the content
+  String csvContent;
+  csvContent.reserve(csvSize + 200); // Reserve extra memory for header
+  
+  // Add header if we trimmed the file
+  if (needsHeader) {
+    csvContent = String(CSV_HEADER) + "\r\n";
+    Serial.println("Adding CSV header (file was trimmed)");
+  }
+  
+  size_t bytesRead = 0;
+  while (csvFile.available() && bytesRead < csvSize) {
+    char c = csvFile.read();
+    csvContent += c;
+    bytesRead++;
+  }
+  
+  csvFile.close();
+  
+  csvSize = csvContent.length();
+  Serial.printf("CSV content read: %u bytes\n", csvSize);
+  
+  // Verify header is present and is the first line
+  if (csvContent.indexOf(CSV_HEADER) == -1) {
+    Serial.println("Warning: CSV header not found in content, adding it...");
+    csvContent = String(CSV_HEADER) + "\r\n" + csvContent;
+    csvSize = csvContent.length();
+  }
+  
+  // Ensure header is the FIRST line (server validates this)
+  int firstNewline = csvContent.indexOf('\n');
+  if (firstNewline > 0) {
+    String firstLine = csvContent.substring(0, firstNewline);
+    firstLine.trim(); // Remove any whitespace/CR
+    
+    Serial.print("First line: '");
+    Serial.print(firstLine);
+    Serial.println("'");
+    Serial.print("Expected: '");
+    Serial.print(CSV_HEADER);
+    Serial.println("'");
+    
+    if (firstLine != CSV_HEADER) {
+      Serial.println("First line doesn't match header - reconstructing CSV...");
+      // Remove everything before first data line and add proper header
+      int secondNewline = csvContent.indexOf('\n', firstNewline + 1);
+      if (secondNewline > 0) {
+        String dataRows = csvContent.substring(secondNewline + 1);
+        csvContent = String(CSV_HEADER) + "\r\n" + dataRows;
+        csvSize = csvContent.length();
+        Serial.println("CSV reconstructed with proper header");
+      }
+    }
+  }
+  
+  // Show first 250 chars for debugging
+  Serial.println("========== First 250 chars of CSV ==========");
+  Serial.println(csvContent.substring(0, min(250, (int)csvSize)));
+  Serial.println("============================================");
+  
+  // Check if content was actually read
+  if (csvSize == 0) {
+    Serial.println("CSV file is empty or failed to read");
+    lastCSVSendStatus = "Failed - Empty file";
+    return false;
+  }
+  
+  Serial.printf("Final CSV size to upload: %u bytes\n", csvSize);
+  Serial.printf("Free heap before upload: %u bytes\n", ESP.getFreeHeap());
+  
+  // Terminate any existing HTTP session first
+  Serial.println("Terminating any existing HTTP session...");
+  sendATCommand("AT+HTTPTERM", 2000);
+  delay(1000);
+  
+  // Initialize HTTP
+  Serial.println("Initializing HTTP...");
+  String initResp = sendATCommand("AT+HTTPINIT", 5000);
+  if (initResp.indexOf("ERROR") != -1) {
+    Serial.println("HTTP already initialized or init error, trying to continue...");
+    // Try to terminate and reinit
+    sendATCommand("AT+HTTPTERM", 2000);
+    delay(1000);
+    initResp = sendATCommand("AT+HTTPINIT", 5000);
+    if (initResp.indexOf("ERROR") != -1) {
+      Serial.println("Failed to initialize HTTP");
+      lastCSVSendStatus = "Failed - HTTP init";
+      return false;
+    }
+  }
+  delay(500);
+  
+  // Set HTTP parameters
+  String cidResp = sendATCommand("AT+HTTPPARA=\"CID\",1", 3000);
+  if (cidResp.indexOf("ERROR") != -1) {
+    Serial.println("Failed to set CID");
+    sendATCommand("AT+HTTPTERM", 2000);
+    lastCSVSendStatus = "Failed - CID";
+    return false;
+  }
+  
+  String urlCmd = "AT+HTTPPARA=\"URL\",\"" + String(serverUrlFull) + "\"";
+  String urlResp = sendATCommand(urlCmd.c_str(), 3000);
+  if (urlResp.indexOf("ERROR") != -1) {
+    Serial.println("Failed to set URL");
+    sendATCommand("AT+HTTPTERM", 2000);
+    lastCSVSendStatus = "Failed - URL";
+    return false;
+  }
+  
+  // Set Content-Type - use application/octet-stream since text/csv might not work on SIM800L
+  // The server has been updated to accept both text/csv and application/octet-stream
+  String contentResp = sendATCommand("AT+HTTPPARA=\"CONTENT\",\"application/octet-stream\"", 3000);
+  if (contentResp.indexOf("ERROR") != -1) {
+    Serial.println("Failed to set Content-Type, trying without it...");
+    // Some SIM800L modules don't support CONTENT parameter well, continue anyway
+  } else {
+    Serial.println("Content-Type set to application/octet-stream");
+  }
+  
+  // Set data to send
+  String dataCmd = "AT+HTTPDATA=" + String(csvSize) + ",85000"; // 30 second timeout for large files
+  sim800lSerial.println(dataCmd);
+  Serial.println(dataCmd);
+  delay(500);
+  
+  // Wait for DOWNLOAD prompt
+  unsigned long start = millis();
+  bool downloadReady = false;
+  
+  while (millis() - start < 5000) {
+    if (sim800lSerial.available()) {
+      String resp = sim800lSerial.readString();
+      Serial.print(resp);
+      if (resp.indexOf("DOWNLOAD") != -1) {
+        downloadReady = true;
+        break;
+      }
+    }
+    delay(10);
+  }
+  
+  if (!downloadReady) {
+    Serial.println("Failed to get DOWNLOAD prompt for CSV");
+    sendATCommand("AT+HTTPTERM", 2000);
+    lastCSVSendStatus = "Failed - Download";
+    return false;
+  }
+  
+  // Send the CSV data
+  sim800lSerial.print(csvContent);
+  delay(1000);
+  
+  // Execute HTTP POST
+  sim800lSerial.println("AT+HTTPACTION=1");
+  Serial.println("AT Command: AT+HTTPACTION=1");
+  
+  // Wait for the actual +HTTPACTION response
+  unsigned long httpStart = millis();
+  String httpResponse = "";
+  
+  while (millis() - httpStart < 30000) { // 30 second timeout for CSV upload
+    if (sim800lSerial.available()) {
+      char c = sim800lSerial.read();
+      httpResponse += c;
+      Serial.print(c);
+      
+      if (httpResponse.indexOf("+HTTPACTION:") != -1) {
+        delay(100);
+        while (sim800lSerial.available()) {
+          c = sim800lSerial.read();
+          httpResponse += c;
+          Serial.print(c);
+        }
+        break;
+      }
+    }
+    delay(10);
+  }
+  
+  Serial.println();
+  Serial.print("CSV Upload Response: ");
+  Serial.println(httpResponse);
+  
+  // Read HTTP response body to see server error message
+  String readResp = sendATCommand("AT+HTTPREAD", 5000);
+  Serial.print("Server response body: ");
+  Serial.println(readResp);
+  
+  // Terminate HTTP
+  sendATCommand("AT+HTTPTERM", 2000);
+  
+  // Check if successful
+  if (httpResponse.indexOf("+HTTPACTION: 1,200") != -1 || httpResponse.indexOf("+HTTPACTION: 1,201") != -1) {
+    Serial.println("CSV file uploaded successfully!");
+    lastCSVSendStatus = "Success";
+    lastCSVSendTime = lastTime;
+    lastCSVSendMillis = millis();
+    return true;
+  } else if (httpResponse.indexOf("+HTTPACTION: 1,500") != -1) {
+    Serial.println("CSV upload failed - Server Error (500)");
+    Serial.println("Check server logs or try different Content-Type");
+    lastCSVSendStatus = "Failed - Server Error 500";
+    return false;
+  } else {
+    Serial.println("CSV upload failed");
+    Serial.print("Expected +HTTPACTION: 1,200 or 201, but got: ");
+    Serial.println(httpResponse);
+    lastCSVSendStatus = "Failed - HTTP " + String(httpResponse);
     return false;
   }
 }
@@ -1190,28 +1604,92 @@ bool sendGPSDataToServer() {
 void maintainGPRS() {
   unsigned long now = millis();
   
-  // Periodically check GPRS connection
-  if (now - lastGprsCheckMillis >= GPRS_CHECK_INTERVAL_MS) {
-    lastGprsCheckMillis = now;
+  // Check if it's time to send CSV file (every 3 hours)
+  if (sim800lReady && (now - lastCSVSendMillis >= CSV_SEND_INTERVAL_MS)) {
+    Serial.println("3 hours elapsed - uploading CSV file to server");
+    sendCSVToServer();
+  }
+  
+  // Only send data if GPS has valid fix
+  if (!gps.location.isValid() || !sim800lReady) {
+    return;
+  }
+  
+  // Check if we should send data based on distance or time
+  bool shouldSend = false;
+  double currentLat = gps.location.lat();
+  double currentLng = gps.location.lng();
+  
+  // If we never sent before, send on first valid fix
+  if (!hasLastSent) {
+    shouldSend = true;
+    isMoving = true;
+    lastMovementMillis = now;
+    Serial.println("First GPS fix - will send to server");
+  } else {
+    // Calculate distance from last sent location
+    double distanceFromLast = haversineDistance(lastSentLat, lastSentLng, currentLat, currentLng);
     
-    if (!gprsConnected && sim800lReady) {
-      connectGPRS();
-    } else if (gprsConnected) {
-      // Check if still connected
-      String queryResp = sendATCommand("AT+SAPBR=2,1", 3000);
-      if (queryResp.indexOf("1,1") == -1) {
-        Serial.println("GPRS connection lost, reconnecting...");
-        gprsConnected = false;
-        gprsStatus = "Reconnecting";
-        connectGPRS();
+    // Check if moved more than 500 meters (device is moving)
+    if (distanceFromLast >= SEND_DISTANCE_THRESHOLD_METERS) {
+      shouldSend = true;
+      isMoving = true;
+      lastMovementMillis = now;
+      Serial.printf("Significant movement detected: %.2f meters - will send to server\n", distanceFromLast);
+      Serial.println("Device is MOVING - keeping GPRS on for rapid updates");
+    }
+    // Or check if 15 minutes have passed (periodic update)
+    else if (now - lastDataSendMillis >= DATA_SEND_INTERVAL_MS) {
+      shouldSend = true;
+      Serial.println("15 minutes elapsed - will send to server");
+    } else {
+      // No significant movement detected
+      Serial.printf("No significant movement (moved %.2f meters, %lu seconds since last send)\n", 
+                   distanceFromLast, (now - lastDataSendMillis) / 1000);
+    }
+    
+    // Check if device has been stationary for a while
+    if (!shouldSend && (now - lastMovementMillis >= STATIONARY_TIMEOUT_MS)) {
+      if (isMoving) {
+        Serial.println("Device has been STATIONARY for 5+ minutes - entering power save mode");
+        isMoving = false;
+        
+        // Disconnect GPRS and put SIM800L to sleep
+        if (gprsConnected) {
+          disconnectGPRS();
+          delay(1000);
+          sleepSIM800L();
+        }
+        
+        // Turn off WiFi AP to save battery (if enabled in config)
+        if (turn_off_wifi_station_for_powersaving) {
+          Serial.println("Turning off WiFi AP (UlTeRa_SpAcE) to save battery...");
+          WiFi.softAPdisconnect(true); // true = turn off AP completely
+          delay(500);
+          Serial.println("WiFi AP disabled - battery saving mode active");
+        } else {
+          Serial.println("WiFi AP kept ON (power saving disabled in config)");
+        }
       }
     }
   }
   
-  // Send data periodically if GPS has valid fix
-  if (gprsConnected && gps.location.isValid() && 
-      now - lastDataSendMillis >= DATA_SEND_INTERVAL_MS) {
-    lastDataSendMillis = now;
+  // Send data if conditions are met
+  if (shouldSend) {
+    // Wake up SIM800L if it's asleep
+    if (!isMoving || sim800lStatus == "Sleep Mode") {
+      wakeSIM800L();
+      delay(1000);
+    }
+    
+    // Turn on WiFi AP if it was disabled
+    if (turn_off_wifi_station_for_powersaving && (WiFi.getMode() == WIFI_OFF || WiFi.getMode() == WIFI_STA)) {
+      Serial.println("Re-enabling WiFi AP (UlTeRa_SpAcE)...");
+      WiFi.softAP(ssid, password);
+      delay(1000);
+      Serial.printf("WiFi AP restored: %s\n", WiFi.softAPIP().toString().c_str());
+    }
+    
     sendGPSDataToServer();
   }
 }
